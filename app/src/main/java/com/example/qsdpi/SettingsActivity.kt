@@ -45,78 +45,84 @@ class SettingsActivity : Activity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(20), dp(20), dp(20))
+            setPadding(dp(24), dp(28), dp(24), dp(28))
+            setBackgroundColor(android.graphics.Color.rgb(12, 19, 38))
         }
-        fun label(text: String, size: Float = 14f) = TextView(this).apply {
-            this.text = text
+        fun label(t: String, size: Float = 14f) = TextView(this).apply {
+            text = t
             textSize = size
-            setPadding(0, dp(12), 0, dp(4))
+            setTextColor(android.graphics.Color.WHITE)
+            gravity = android.view.Gravity.CENTER
+            setPadding(0, dp(12), 0, dp(8))
         }
-
-        root.addView(label("Quick settings DPI", 22f))
-        root.addView(label(
-            "System DPI right now: $systemDpi\n" +
-                "Higher DPI = smaller padding, buttons and text in the panel. " +
-                "Set 0 (or leave empty) to disable the override."
-        ))
-
+        root.addView(label("◈  QUICK SETTINGS DPI", 19f))
+        root.addView(label("SYSTEM  /  DISPLAY TUNER", 11f))
         dpiInput = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            hint = "Panel DPI, e.g. ${(systemDpi * 1.1).toInt()}"
-            val saved = prefs.getInt(Prefs.KEY_DPI, 0)
-            if (saved > 0) setText(saved.toString())
+            val saved = prefs.getInt(Prefs.KEY_DPI, 500).coerceIn(400, 600)
+            setText(saved.toString())
+            textSize = 64f
+            gravity = android.view.Gravity.CENTER
+            setTextColor(android.graphics.Color.rgb(100, 225, 255))
+            isFocusable = false
+            background = null
         }
         root.addView(dpiInput)
-
-        preview = TextView(this)
+        val slider = android.widget.SeekBar(this).apply {
+            max = 200
+            progress = dpiInput.text.toString().toInt() - 400
+            progressTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.CYAN)
+            thumbTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE)
+            setPadding(dp(8), dp(20), dp(8), dp(20))
+        }
+        root.addView(slider)
+        root.addView(label("400                 ◇                 600", 13f))
+        preview = label("")
         root.addView(preview)
-        dpiInput.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
-            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
-            override fun afterTextChanged(s: Editable?) = updatePreview()
+        slider.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: android.widget.SeekBar?, p: Int, user: Boolean) {
+                dpiInput.setText((400 + p).toString())
+                updatePreview()
+            }
+            override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
+            override fun onStopTrackingTouch(s: android.widget.SeekBar?) {}
         })
         updatePreview()
-
-        root.addView(label("Target package (advanced)"))
+        root.addView(label("Target package · advanced"))
         targetInput = EditText(this).apply {
             setText(prefs.getString(Prefs.KEY_TARGET, Prefs.DEFAULT_TARGET))
-            hint = Prefs.DEFAULT_TARGET
+            setTextColor(android.graphics.Color.WHITE)
             setSingleLine()
         }
         root.addView(targetInput)
-
         debugBox = CheckBox(this).apply {
-            text = "Verbose logging (LSPosed log, search for QsDpi)"
+            text = "Verbose logging"
+            setTextColor(android.graphics.Color.WHITE)
             isChecked = prefs.getBoolean(Prefs.KEY_DEBUG, false)
         }
         root.addView(debugBox)
-
-        root.addView(Button(this).apply {
-            text = "Save"
-            setOnClickListener {
-                if (save()) toast("Saved. Restart System UI to apply.")
+        val actions = LinearLayout(this).apply { gravity = android.view.Gravity.CENTER }
+        fun circle(symbol: String, description: String, action: () -> Unit) =
+            Button(this).apply {
+                text = symbol
+                textSize = 26f
+                contentDescription = description
+                setTextColor(android.graphics.Color.WHITE)
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(android.graphics.Color.rgb(32, 112, 180))
+                    setStroke(dp(2), android.graphics.Color.CYAN)
+                }
+                setOnClickListener { action() }
             }
-        })
-        root.addView(Button(this).apply {
-            text = "Save and restart System UI (root)"
-            setOnClickListener { if (save()) restartSystemUi() }
-        })
-
-        if (!moduleActive) {
-            root.addView(label(
-                "Module is not active in LSPosed yet: enable it, tick System UI " +
-                    "(com.android.systemui) in its scope, then reopen this app."
-            ))
-        }
-
-        setContentView(
-            ScrollView(this).apply {
-                addView(root, ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ))
-            }
-        )
+        actions.addView(circle("▣", "Save") {
+            if (save()) toast("Saved. Restart System UI to apply.")
+        }, LinearLayout.LayoutParams(dp(76), dp(76)).apply { setMargins(dp(12), dp(12), dp(12), dp(12) })
+        actions.addView(circle("↻", "Save and restart System UI") {
+            if (save()) restartSystemUi()
+        }, LinearLayout.LayoutParams(dp(76), dp(76)).apply { setMargins(dp(12), dp(12), dp(12), dp(12) })
+        root.addView(actions)
+        if (!moduleActive) root.addView(label("Enable the module and select System UI in LSPosed."))
+        setContentView(ScrollView(this).apply { addView(root) })
     }
 
     private fun parseDpi(): Int {
