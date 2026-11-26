@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">QS DPI</string>
+    <string name="xposed_description">Gives the HyperOS quick settings / control center its own DPI.</string>
+</resources>
