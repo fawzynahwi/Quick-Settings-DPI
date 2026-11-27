@@ -1,0 +1,31 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- gauge track -->
+    <path
+        android:pathData="M32.79,75.21 A30,30 0 1 1 75.21,75.21"
+        android:strokeColor="#59FFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+    <!-- gauge value -->
+    <path
+        android:pathData="M32.79,75.21 A30,30 0 0 1 66.68,26.81"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+    <!-- 2x2 quick settings tiles -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M39.5,35.5 h8 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-8 a4,4 0 0 1 -4,-4 v-8 a4,4 0 0 1 4,-4 z" />
+    <path
+        android:fillColor="#99FFFFFF"
+        android:pathData="M60.5,35.5 h8 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-8 a4,4 0 0 1 -4,-4 v-8 a4,4 0 0 1 4,-4 z" />
+    <path
+        android:fillColor="#99FFFFFF"
+        android:pathData="M39.5,56.5 h8 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-8 a4,4 0 0 1 -4,-4 v-8 a4,4 0 0 1 4,-4 z" />
+    <path
+        android:fillColor="#99FFFFFF"
+        android:pathData="M60.5,56.5 h8 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-8 a4,4 0 0 1 -4,-4 v-8 a4,4 0 0 1 4,-4 z" />
+</vector>
