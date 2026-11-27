@@ -28,7 +28,9 @@ Big animated DPI dial, 400-600 slider (with a marker for your system DPI), +/- f
 and two round buttons: **Save** and **Save + restart System UI** (root). "Advanced" has the target package and verbose logging.
 
 ## How it works
-Two layers keep the plugin at your DPI:
+Three layers keep the plugin at your DPI:
+0. (build 4) Every `ResourcesKey` for the plugin APK gets the density baked into its override configuration, so
+   ResourcesManager re-applies it on every global configuration change (dark mode included).
 1. The plugin's Context is wrapped in a density-only configuration override when SystemUI creates it.
 2. `ResourcesImpl.updateConfiguration` is hooked: whenever Android applies a configuration (dark mode, theme, rotation...)
    to Resources that load the plugin APK, the density is forced back to your value.
