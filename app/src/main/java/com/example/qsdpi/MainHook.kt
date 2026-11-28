@@ -4,8 +4,11 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.res.Configuration
 import android.content.res.Resources
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.DisplayMetrics
+import android.view.LayoutInflater
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XSharedPreferences
@@ -19,7 +22,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 private const val TAG = "QsDpi"
-private const val BUILD = "build 4 (diagnostics + reapply)"
+private const val BUILD = "build 5 (late audit + inflate/metrics probes)"
 
 private fun log(msg: String) = XposedBridge.log("[$TAG] $msg")
 private fun log(msg: String, t: Throwable) = XposedBridge.log("[$TAG] $msg\n${t.stackTraceToString()}")
@@ -83,8 +86,18 @@ class MainHook : IXposedHookLoadPackage {
             val resourcesManager = XposedHelpers.findClass("android.app.ResourcesManager", lpparam.classLoader)
             val hooks = XposedBridge.hookAllMethods(resourcesManager, "applyConfigurationToResources", ReapplyHook)
             if (hooks.isEmpty()) log("ResourcesManager.applyConfigurationToResources not found") else log("reapply hook installed")
+            val h2 = XposedBridge.hookAllMethods(resourcesManager, "updateResourcesForActivity", ActivityResourcesHook)
+            log(if (h2.isEmpty()) "ResourcesManager.updateResourcesForActivity not found" else "activity resources hook installed")
         } catch (t: Throwable) {
             log("failed to install reapply hook", t)
+        }
+
+        try {
+            XposedBridge.hookAllMethods(LayoutInflater::class.java, "inflate", InflateHook)
+            XposedBridge.hookAllMethods(Resources::class.java, "getDisplayMetrics", MetricsHook)
+            log("probes installed")
+        } catch (t: Throwable) {
+            log("failed to install probes", t)
         }
     }
 
@@ -138,13 +151,19 @@ internal object Settings {
 internal object Diag {
     private val ctxBudget = AtomicInteger(80)
     private val resBudget = AtomicInteger(15)
+    private val inflBudget = AtomicInteger(40)
+    private val metricsBudget = AtomicInteger(25)
 
     fun takeCtx(): Boolean = ctxBudget.getAndDecrement() > 0
     fun takeRes(): Boolean = resBudget.getAndDecrement() > 0
+    fun takeInflate(): Boolean = inflBudget.getAndDecrement() > 0
+    fun takeMetrics(): Boolean = metricsBudget.getAndDecrement() > 0
 
     fun newWindow() {
         ctxBudget.set(80)
         resBudget.set(15)
+        inflBudget.set(40)
+        metricsBudget.set(25)
     }
 }
 
@@ -364,32 +383,21 @@ private object ResourcesImplHook : XC_MethodHook() {
 }
 
 /**
- * Safety net: after Android applied a new global configuration (dark mode, rotation, ...) to all
- * Resources, look at every plugin ResourcesImpl and push the chosen density back if it drifted.
- * This does not depend on ResourcesImpl.updateConfiguration being hookable.
+ * Audits every plugin ResourcesImpl and pushes the chosen density back where it drifted.
+ * Does not depend on ResourcesImpl.updateConfiguration being hookable.
  */
-private object ReapplyHook : XC_MethodHook() {
+internal object Auditor {
     private val busy = ThreadLocal<Boolean>()
     private val audits = AtomicInteger(0)
     private val fixes = AtomicInteger(0)
 
-    override fun beforeHookedMethod(param: MethodHookParam) {
-        Diag.newWindow()
-        val s = Settings.get()
-        if (s.debug) {
-            val cfg = param.args.getOrNull(0) as? Configuration
-            if (cfg != null) log("config change: density ${cfg.densityDpi} ${dayNight(cfg)}")
-        }
-    }
-
-    override fun afterHookedMethod(param: MethodHookParam) {
+    fun run(rm: Any, tag: String) {
         if (busy.get() == true) return
         busy.set(true)
         try {
             val s = Settings.get()
             if (s.dpi !in Prefs.MIN_DPI..Prefs.MAX_DPI || PluginPaths.isEmpty()) return
 
-            val rm = param.thisObject
             val lock: Any = try {
                 XposedHelpers.getObjectField(rm, "mLock") ?: rm
             } catch (t: Throwable) {
@@ -437,17 +445,99 @@ private object ReapplyHook : XC_MethodHook() {
                 fixed++
             }
 
-            if (fixed > 0 && fixes.getAndIncrement() < 40) {
-                log("reapply: pushed ${s.dpi} dpi back onto $fixed of $matchedCount plugin resource sets after a config change")
+            if (fixed > 0 && fixes.getAndIncrement() < 60) {
+                log("reapply[$tag]: pushed ${s.dpi} dpi back onto $fixed of $matchedCount plugin resource sets")
             }
-            if (s.debug && audits.getAndIncrement() < 60) {
-                log("audit: plugin sets=$matchedCount fixed=$fixed total sets=${impls.size} $summary")
+            if (s.debug && audits.getAndIncrement() < 100) {
+                log("audit[$tag]: plugin sets=$matchedCount fixed=$fixed total sets=${impls.size} $summary")
             }
         } catch (t: Throwable) {
-            log("reapply hook failed", t)
+            log("audit[$tag] failed", t)
         } finally {
             busy.set(false)
         }
+    }
+}
+
+private object ReapplyHook : XC_MethodHook() {
+    private val handler by lazy { Handler(Looper.getMainLooper()) }
+
+    override fun beforeHookedMethod(param: MethodHookParam) {
+        Diag.newWindow()
+        val s = Settings.get()
+        if (s.debug) {
+            val cfg = param.args.getOrNull(0) as? Configuration
+            if (cfg != null) log("config change: density ${cfg.densityDpi} ${dayNight(cfg)}")
+        }
+    }
+
+    override fun afterHookedMethod(param: MethodHookParam) {
+        val rm = param.thisObject ?: return
+        Auditor.run(rm, "cfg")
+        // Catch anything that re-applies density after the dispatch (plugin code, theme switch, ...).
+        try {
+            handler.postDelayed({ Auditor.run(rm, "late300") }, 300L)
+            handler.postDelayed({ Auditor.run(rm, "late1500") }, 1500L)
+        } catch (t: Throwable) {
+            // ignore
+        }
+    }
+}
+
+/** Window-token resources are updated through a different ResourcesManager entry point. */
+private object ActivityResourcesHook : XC_MethodHook() {
+    @Volatile private var last = 0L
+
+    override fun afterHookedMethod(param: MethodHookParam) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - last < 30L) return
+        last = now
+        val rm = param.thisObject ?: return
+        Auditor.run(rm, "activity")
+    }
+}
+
+/** Verbose only: which density do plugin layouts get inflated with? */
+private object InflateHook : XC_MethodHook() {
+    override fun beforeHookedMethod(param: MethodHookParam) {
+        val s = Settings.get()
+        if (!s.debug) return
+        val id = param.args.getOrNull(0) as? Int ?: return
+        val inflater = param.thisObject as? LayoutInflater ?: return
+        try {
+            val ctx = inflater.context
+            if (ctx.packageName != s.target) return
+            if (!Diag.takeInflate()) return
+            val res = ctx.resources
+            val cfg = res.configuration
+            val name = try {
+                res.getResourceEntryName(id)
+            } catch (t: Throwable) {
+                "0x${Integer.toHexString(id)}"
+            }
+            log("inflate $name ctx=${ctx.javaClass.simpleName} cfgDensity=${cfg.densityDpi} " +
+                "metricsDpi=${res.displayMetrics.densityDpi} ${dayNight(cfg)} via ${callers()}")
+        } catch (t: Throwable) {
+            // ignore
+        }
+    }
+}
+
+/**
+ * Verbose only, sampled: plugin classes that read a DisplayMetrics whose density is not the chosen
+ * one (which would make the panel look "reset" even though the plugin resources are right).
+ */
+private object MetricsHook : XC_MethodHook() {
+    private val n = AtomicInteger(0)
+
+    override fun afterHookedMethod(param: MethodHookParam) {
+        val dm = param.result as? DisplayMetrics ?: return
+        val s = Settings.get()
+        if (!s.debug || s.dpi !in Prefs.MIN_DPI..Prefs.MAX_DPI || dm.densityDpi == s.dpi) return
+        if (n.incrementAndGet() % 40 != 0) return
+        if (!Diag.takeMetrics()) return
+        val frame = Throwable().stackTrace.firstOrNull { it.className.startsWith("miui.systemui.") } ?: return
+        log("getDisplayMetrics gave ${dm.densityDpi} (want ${s.dpi}) to ${frame.className}.${frame.methodName} via ${callers()}")
     }
 }
 
