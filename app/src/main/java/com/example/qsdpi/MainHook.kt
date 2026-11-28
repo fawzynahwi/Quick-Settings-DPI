@@ -19,10 +19,13 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 private const val TAG = "QsDpi"
-private const val BUILD = "build 4 (resources-key fix)"
+private const val BUILD = "build 4 (diagnostics + reapply)"
 
 private fun log(msg: String) = XposedBridge.log("[$TAG] $msg")
 private fun log(msg: String, t: Throwable) = XposedBridge.log("[$TAG] $msg\n${t.stackTraceToString()}")
+
+internal fun dayNight(cfg: Configuration): String =
+    if ((cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES) "night" else "day"
 
 /** Short "who called this" string for the log (framework / hook frames removed). */
 private fun callers(): String =
@@ -31,21 +34,24 @@ private fun callers(): String =
         .filterNot { n ->
             n.startsWith("com.example.qsdpi") || n.startsWith("de.robv") || n.startsWith("org.lsposed") ||
                 n.startsWith("org.matrix") || n.startsWith("LSP") || n.startsWith("java.lang.reflect") ||
-                n.startsWith("android.app.ContextImpl") || n.startsWith("android.content.ContextWrapper")
+                n.startsWith("android.app.ContextImpl") || n.startsWith("android.content.ContextWrapper") ||
+                n.contains("XposedBridge") || n.startsWith("e2.") || n.startsWith("c3.") || n.startsWith("g.a")
         }
-        .take(8)
+        .take(6)
         .joinToString(" < ")
 
 /**
  * HyperOS keeps the control center (quick settings) in a separate plugin APK that SystemUI
- * loads into its own process. Three layers keep that plugin at your DPI:
+ * loads into its own process. Layers that keep that plugin at your DPI:
  *
  * 1. When SystemUI creates the plugin's Context, it is wrapped in a configuration override
  *    that only changes densityDpi.
  * 2. Contexts derived from it with createConfigurationContext() (which would otherwise drop the
- *    override) get the density injected as well.
+ *    override) get the density injected as well. createDisplayContext() results are wrapped too.
  * 3. Every time Android (re)applies a configuration to Resources that belong to the plugin APK,
- *    the density is forced back to your value.
+ *    the density is forced back to your value (ResourcesImpl.updateConfiguration hook).
+ * 4. NEW in build 4: after every global configuration change (dark mode, rotation, ...) all plugin
+ *    ResourcesImpl objects are audited and, if their density drifted, re-applied directly.
  */
 class MainHook : IXposedHookLoadPackage {
 
@@ -58,6 +64,8 @@ class MainHook : IXposedHookLoadPackage {
             XposedBridge.hookAllMethods(contextImpl, "createApplicationContext", ContextHook)
             XposedBridge.hookAllMethods(contextImpl, "createPackageContextAsUser", ContextHook)
             XposedBridge.hookAllMethods(contextImpl, "createConfigurationContext", ConfigContextHook)
+            XposedBridge.hookAllMethods(contextImpl, "createDisplayContext", DerivedContextHook)
+            XposedBridge.hookAllMethods(contextImpl, "createWindowContext", DerivedContextHook)
             log("context hooks installed in ${lpparam.processName} - $BUILD")
         } catch (t: Throwable) {
             log("failed to install context hooks", t)
@@ -71,15 +79,12 @@ class MainHook : IXposedHookLoadPackage {
             log("failed to install resources hook", t)
         }
 
-        // Layer 0: bake the density into the ResourcesKey of every Resources object that loads the
-        // plugin APK. ResourcesManager re-applies a key's override configuration on every global
-        // configuration change (dark mode included), so this survives them without any further hook.
         try {
-            val keyClass = XposedHelpers.findClass("android.content.res.ResourcesKey", lpparam.classLoader)
-            val hooks = XposedBridge.hookAllConstructors(keyClass, ResourcesKeyHook)
-            if (hooks.isEmpty()) log("ResourcesKey constructors not found") else log("resources key hook installed")
+            val resourcesManager = XposedHelpers.findClass("android.app.ResourcesManager", lpparam.classLoader)
+            val hooks = XposedBridge.hookAllMethods(resourcesManager, "applyConfigurationToResources", ReapplyHook)
+            if (hooks.isEmpty()) log("ResourcesManager.applyConfigurationToResources not found") else log("reapply hook installed")
         } catch (t: Throwable) {
-            log("failed to install resources key hook", t)
+            log("failed to install reapply hook", t)
         }
     }
 
@@ -126,31 +131,31 @@ internal object Settings {
     }
 }
 
+/**
+ * Log budgets. They are refilled on every global configuration change, so the lines around a
+ * dark-mode switch are never starved by the startup noise.
+ */
+internal object Diag {
+    private val ctxBudget = AtomicInteger(80)
+    private val resBudget = AtomicInteger(15)
+
+    fun takeCtx(): Boolean = ctxBudget.getAndDecrement() > 0
+    fun takeRes(): Boolean = resBudget.getAndDecrement() > 0
+
+    fun newWindow() {
+        ctxBudget.set(80)
+        resBudget.set(15)
+    }
+}
+
 /** Knows which Resources belong to the plugin APK. */
 internal object PluginPaths {
     private val paths: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private val known: MutableMap<Any, Boolean> = Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
     @Volatile private var announced = false
-    @Volatile private var assetFailLogged = false
+    @Volatile private var reflectionWarned = false
 
     fun isEmpty(): Boolean = paths.isEmpty() && known.isEmpty()
-
-    fun containsPath(p: String?): Boolean = !p.isNullOrEmpty() && p in paths
-
-    /**
-     * Learn the plugin's APK path as early as possible (createPackageContextAsUser(String) gives us
-     * no ApplicationInfo), so the very first Resources for the plugin already get the density.
-     */
-    @Suppress("DEPRECATION")
-    fun seedFrom(context: Any?, pkg: String) {
-        if (paths.isNotEmpty()) return
-        try {
-            val ctx = context as? Context ?: return
-            remember(ctx.packageManager.getApplicationInfo(pkg, 0))
-        } catch (t: Throwable) {
-            // ignore, it will be filled in by the first ApplicationInfo-based call
-        }
-    }
 
     private fun add(p: String?) {
         if (p.isNullOrEmpty()) return
@@ -180,7 +185,10 @@ internal object PluginPaths {
             val impl = XposedHelpers.getObjectField(resources, "mResourcesImpl") ?: return
             known[impl] = true
         } catch (t: Throwable) {
-            // ignore
+            if (!reflectionWarned) {
+                reflectionWarned = true
+                log("cannot read Resources.mResourcesImpl", t)
+            }
         }
     }
 
@@ -193,9 +201,9 @@ internal object PluginPaths {
                 if (apk == null) null else XposedHelpers.callMethod(apk, "getAssetPath") as? String
             }
         } catch (t: Throwable) {
-            if (!assetFailLogged) {
-                assetFailLogged = true
-                log("cannot read the APK paths of a ResourcesImpl - path matching is unreliable", t)
+            if (!reflectionWarned) {
+                reflectionWarned = true
+                log("cannot read apk paths from ResourcesImpl", t)
             }
             emptyList()
         }
@@ -205,21 +213,23 @@ internal object PluginPaths {
     fun matches(impl: Any?): Boolean {
         if (impl == null) return false
         if (known.containsKey(impl)) return true
-        return assetPaths(impl).any { it in paths }
+        return assetPaths(impl).any { p ->
+            p in paths || try {
+                File(p).canonicalPath in paths
+            } catch (t: Throwable) {
+                false
+            }
+        }
     }
 }
 
 private object ContextHook : XC_MethodHook() {
     private val seen: MutableSet<String> = Collections.synchronizedSet(HashSet())
-    private val created = AtomicInteger(0)
 
     override fun beforeHookedMethod(param: MethodHookParam) {
         // Register the plugin's APK path before its resources get created.
-        when (val first = param.args.getOrNull(0)) {
-            is ApplicationInfo -> if (first.packageName == Settings.get().target) PluginPaths.remember(first)
-            is String -> if (first == Settings.get().target) PluginPaths.seedFrom(param.thisObject, first)
-            else -> Unit
-        }
+        val info = param.args.getOrNull(0) as? ApplicationInfo ?: return
+        if (info.packageName == Settings.get().target) PluginPaths.remember(info)
     }
 
     override fun afterHookedMethod(param: MethodHookParam) {
@@ -233,7 +243,7 @@ private object ContextHook : XC_MethodHook() {
         val s = Settings.get()
         if (s.debug) {
             if (pkg == s.target) {
-                if (created.getAndIncrement() < 60) log("${param.method.name}($pkg) via ${callers()}")
+                if (Diag.takeCtx()) log("${param.method.name}($pkg) via ${callers()}")
             } else if (seen.add("${param.method.name}:$pkg")) {
                 log("${param.method.name}($pkg)")
             }
@@ -252,67 +262,63 @@ private object ContextHook : XC_MethodHook() {
 /**
  * createConfigurationContext() builds its Resources from the given configuration only, so it would
  * silently drop the density override of the context it is called on. Inject the density again.
+ * In verbose mode every call is logged (any package), with day/night, so the dark-mode path is visible.
  */
 private object ConfigContextHook : XC_MethodHook() {
-    private val logged = AtomicInteger(0)
-
     override fun beforeHookedMethod(param: MethodHookParam) {
         val ctx = param.thisObject as? Context ?: return
-        val s = Settings.get()
-        if (s.dpi !in Prefs.MIN_DPI..Prefs.MAX_DPI) return
-        if (ctx.packageName != s.target) return
         val cfg = param.args.getOrNull(0) as? Configuration ?: return
+        val s = Settings.get()
+        val pkg = try {
+            ctx.packageName
+        } catch (t: Throwable) {
+            return
+        }
+        val isTarget = pkg == s.target
+        val inRange = s.dpi in Prefs.MIN_DPI..Prefs.MAX_DPI
+        val needsFix = isTarget && inRange && cfg.densityDpi != s.dpi
 
-        val needsFix = cfg.densityDpi != s.dpi
-        if (s.debug && logged.getAndIncrement() < 60) {
-            log("createConfigurationContext on ${ctx.packageName}: density ${cfg.densityDpi}" +
-                (if (needsFix) " -> ${s.dpi}" else " (ok)") + " via ${callers()}")
+        if (s.debug && Diag.takeCtx()) {
+            log("createConfigurationContext on $pkg${if (isTarget) "" else " (other)"}: " +
+                "density ${cfg.densityDpi} ${dayNight(cfg)}" +
+                (if (needsFix) " -> ${s.dpi}" else if (isTarget) " (ok)" else "") + " via ${callers()}")
         }
         if (needsFix) param.args[0] = Configuration(cfg).apply { densityDpi = s.dpi }
-    }
-
-    /** Remember the Resources of every context derived from the plugin (day/night contexts etc.). */
-    override fun afterHookedMethod(param: MethodHookParam) {
-        try {
-            val ctx = param.thisObject as? Context ?: return
-            val s = Settings.get()
-            if (s.dpi !in Prefs.MIN_DPI..Prefs.MAX_DPI || ctx.packageName != s.target) return
-            PluginPaths.markImpl((param.result as? Context)?.resources)
-        } catch (t: Throwable) {
-            // ignore
-        }
     }
 }
 
 /**
- * Layer 0. Every Resources object that loads the plugin APK is described by a ResourcesKey. If the
- * key carries our density in its override configuration, ResourcesManager keeps applying it on top of
- * every global configuration change, so a dark mode switch cannot bring the system density back.
+ * createDisplayContext()/createWindowContext() build Resources without the density override of the
+ * context they are called on. Display contexts of the plugin are wrapped; window contexts are only
+ * logged (wrapping them could break the window token handling).
  */
-private object ResourcesKeyHook : XC_MethodHook() {
-    private val forced = AtomicInteger(0)
-
-    override fun beforeHookedMethod(param: MethodHookParam) {
-        try {
-            val resDir = param.args.getOrNull(0) as? String ?: return
-            if (!PluginPaths.containsPath(resDir)) return
-
-            val s = Settings.get()
-            if (s.dpi !in Prefs.MIN_DPI..Prefs.MAX_DPI) return
-
-            val types = (param.method as java.lang.reflect.Constructor<*>).parameterTypes
-            val idx = types.indexOf(Configuration::class.java)
-            if (idx < 0) return
-
-            val cfg = param.args[idx] as? Configuration
-            if (cfg != null && cfg.densityDpi == s.dpi) return
-            param.args[idx] = Configuration(cfg ?: Configuration()).apply { densityDpi = s.dpi }
-
-            if (s.debug && forced.getAndIncrement() < 20) {
-                log("ResourcesKey for plugin: override density ${cfg?.densityDpi ?: "none"} -> ${s.dpi} via ${callers()}")
-            }
+private object DerivedContextHook : XC_MethodHook() {
+    override fun afterHookedMethod(param: MethodHookParam) {
+        val src = param.thisObject as? Context ?: return
+        val res = param.result as? Context ?: return
+        val s = Settings.get()
+        val pkg = try {
+            src.packageName
         } catch (t: Throwable) {
-            log("resources key hook failed", t)
+            return
+        }
+        if (pkg != s.target) return
+
+        val before = try {
+            res.resources.configuration.densityDpi
+        } catch (t: Throwable) {
+            return
+        }
+        if (s.debug && Diag.takeCtx()) {
+            log("${param.method.name} on $pkg -> density $before (want ${s.dpi}) via ${callers()}")
+        }
+        if (s.dpi !in Prefs.MIN_DPI..Prefs.MAX_DPI || before == s.dpi) return
+        if (param.method.name != "createDisplayContext") return
+
+        val wrapped = withDensity(res, pkg, s.dpi)
+        if (wrapped !== res) {
+            PluginPaths.markImpl(wrapped.resources)
+            param.result = wrapped
         }
     }
 }
@@ -321,12 +327,10 @@ private object ResourcesKeyHook : XC_MethodHook() {
 private object ResourcesImplHook : XC_MethodHook() {
     private val busy = ThreadLocal<Boolean>()
     private val kept = AtomicInteger(0)
-    private val traced = AtomicInteger(0)
     private val calls = AtomicInteger(0)
-    private val repaired = AtomicInteger(0)
 
     override fun beforeHookedMethod(param: MethodHookParam) {
-        if (PluginPaths.isEmpty() || busy.get() == true) return
+        if (busy.get() == true) return
         busy.set(true)
         try {
             val idx = param.args.indexOfFirst { it is Configuration }
@@ -334,29 +338,21 @@ private object ResourcesImplHook : XC_MethodHook() {
             val cfg = param.args[idx] as Configuration
 
             val s = Settings.get()
+            if (s.debug && calls.getAndIncrement() == 0) log("ResourcesImpl hook is being invoked")
+            if (PluginPaths.isEmpty()) return
             if (s.dpi !in Prefs.MIN_DPI..Prefs.MAX_DPI) return
 
             val matched = PluginPaths.matches(param.thisObject)
-            if (matched) param.setObjectExtra(EXTRA_MATCHED, true)
 
-            // Heartbeat: proves the hook is reached at all, whatever the result of the matching.
-            if (s.debug && calls.incrementAndGet() <= 5) {
-                log("ResourcesImpl.updateConfiguration reached: density=${cfg.densityDpi} matched=$matched " +
-                    "apks=${PluginPaths.assetPaths(param.thisObject)}")
-            }
-
-            if (s.debug && traced.get() < 80) {
-                val apks = if (matched) emptyList<String>() else PluginPaths.assetPaths(param.thisObject)
-                val interesting = matched || apks.any { it.contains("plugin", ignoreCase = true) }
-                if (interesting && traced.getAndIncrement() < 80) {
-                    log("ResourcesImpl.updateConfiguration density=${cfg.densityDpi} matched=$matched" +
-                        (if (matched) "" else " apks=$apks"))
-                }
+            if (s.debug && Diag.takeRes()) {
+                val apks = PluginPaths.assetPaths(param.thisObject).map { it.substringAfterLast('/') }
+                log("ResourcesImpl.updateConfiguration density=${cfg.densityDpi} ${dayNight(cfg)} " +
+                    "matched=$matched apks=$apks")
             }
 
             if (!matched || cfg.densityDpi == s.dpi) return
             param.args[idx] = Configuration(cfg).apply { densityDpi = s.dpi }
-            if (kept.getAndIncrement() < 10) {
+            if (kept.getAndIncrement() < 20) {
                 log("kept ${s.dpi} dpi on plugin resources (config update carried ${cfg.densityDpi}) via ${callers()}")
             }
         } catch (t: Throwable) {
@@ -365,38 +361,94 @@ private object ResourcesImplHook : XC_MethodHook() {
             busy.set(false)
         }
     }
+}
 
-    /**
-     * Safety net: if something inside updateConfiguration (an OEM patch, a theme manager...) still
-     * left a different density on a plugin ResourcesImpl, put ours back.
-     */
-    @Suppress("DEPRECATION")
-    override fun afterHookedMethod(param: MethodHookParam) {
-        try {
-            if (param.getObjectExtra(EXTRA_MATCHED) != true) return
-            val s = Settings.get()
-            if (s.dpi !in Prefs.MIN_DPI..Prefs.MAX_DPI) return
-            val impl = param.thisObject ?: return
-            val cur = XposedHelpers.getObjectField(impl, "mConfiguration") as? Configuration ?: return
-            if (cur.densityDpi == s.dpi) return
+/**
+ * Safety net: after Android applied a new global configuration (dark mode, rotation, ...) to all
+ * Resources, look at every plugin ResourcesImpl and push the chosen density back if it drifted.
+ * This does not depend on ResourcesImpl.updateConfiguration being hookable.
+ */
+private object ReapplyHook : XC_MethodHook() {
+    private val busy = ThreadLocal<Boolean>()
+    private val audits = AtomicInteger(0)
+    private val fixes = AtomicInteger(0)
 
-            val was = cur.densityDpi
-            cur.densityDpi = s.dpi
-            val metrics = XposedHelpers.getObjectField(impl, "mMetrics") as? DisplayMetrics
-            if (metrics != null) {
-                metrics.densityDpi = s.dpi
-                metrics.density = s.dpi / 160f
-                metrics.scaledDensity = metrics.density * (if (cur.fontScale > 0f) cur.fontScale else 1f)
-            }
-            if (repaired.getAndIncrement() < 10) {
-                log("repaired plugin resources: density $was -> ${s.dpi} after updateConfiguration via ${callers()}")
-            }
-        } catch (t: Throwable) {
-            log("resources repair failed", t)
+    override fun beforeHookedMethod(param: MethodHookParam) {
+        Diag.newWindow()
+        val s = Settings.get()
+        if (s.debug) {
+            val cfg = param.args.getOrNull(0) as? Configuration
+            if (cfg != null) log("config change: density ${cfg.densityDpi} ${dayNight(cfg)}")
         }
     }
 
-    private const val EXTRA_MATCHED = "qsdpi.matched"
+    override fun afterHookedMethod(param: MethodHookParam) {
+        if (busy.get() == true) return
+        busy.set(true)
+        try {
+            val s = Settings.get()
+            if (s.dpi !in Prefs.MIN_DPI..Prefs.MAX_DPI || PluginPaths.isEmpty()) return
+
+            val rm = param.thisObject
+            val lock: Any = try {
+                XposedHelpers.getObjectField(rm, "mLock") ?: rm
+            } catch (t: Throwable) {
+                rm
+            }
+            val impls = ArrayList<Any>()
+            synchronized(lock) {
+                val map = XposedHelpers.getObjectField(rm, "mResourceImpls") as? Map<*, *> ?: return
+                for (v in map.values) {
+                    val impl = (v as? java.lang.ref.WeakReference<*>)?.get() ?: continue
+                    impls.add(impl)
+                }
+            }
+
+            val compatClass = Class.forName("android.content.res.CompatibilityInfo")
+            val types = arrayOf<Class<*>>(Configuration::class.java, DisplayMetrics::class.java, compatClass)
+            val summary = LinkedHashMap<String, Int>()
+            var matchedCount = 0
+            var fixed = 0
+
+            for (impl in impls) {
+                val matched = PluginPaths.matches(impl)
+                val cfg = XposedHelpers.callMethod(impl, "getConfiguration") as? Configuration ?: continue
+                if (s.debug) {
+                    val name = if (matched) "PLUGIN" else
+                        (PluginPaths.assetPaths(impl).firstOrNull()?.substringAfterLast('/') ?: "?")
+                    val key = "$name:${cfg.densityDpi}"
+                    summary[key] = (summary[key] ?: 0) + 1
+                }
+                if (!matched) continue
+                matchedCount++
+                if (cfg.densityDpi == s.dpi) continue
+
+                val fixedCfg = Configuration(cfg).apply { densityDpi = s.dpi }
+                val dm = XposedHelpers.callMethod(impl, "getDisplayMetrics") as? DisplayMetrics ?: continue
+                val compat = try {
+                    XposedHelpers.callMethod(
+                        XposedHelpers.callMethod(impl, "getDisplayAdjustments"),
+                        "getCompatibilityInfo",
+                    )
+                } catch (t: Throwable) {
+                    null
+                }
+                XposedHelpers.callMethod(impl, "updateConfiguration", types, fixedCfg, dm, compat)
+                fixed++
+            }
+
+            if (fixed > 0 && fixes.getAndIncrement() < 40) {
+                log("reapply: pushed ${s.dpi} dpi back onto $fixed of $matchedCount plugin resource sets after a config change")
+            }
+            if (s.debug && audits.getAndIncrement() < 60) {
+                log("audit: plugin sets=$matchedCount fixed=$fixed total sets=${impls.size} $summary")
+            }
+        } catch (t: Throwable) {
+            log("reapply hook failed", t)
+        } finally {
+            busy.set(false)
+        }
+    }
 }
 
 private fun withDensity(base: Context, pkg: String, dpi: Int): Context {
